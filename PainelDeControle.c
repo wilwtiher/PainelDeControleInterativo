@@ -41,11 +41,9 @@
 
 #define MAX_USERS 8
 
-bool Foi_A = false;
-bool Foi_B = false;
-bool Foi_Joystick = false;
 ssd1306_t ssd;
-SemaphoreHandle_t xContadorSem;
+SemaphoreHandle_t xContadorSemA;
+SemaphoreHandle_t xContadorSemB;
 SemaphoreHandle_t xBinarySemaphoreReset;
 SemaphoreHandle_t xOLEDMutex;
 uint16_t eventosProcessados = 0;
@@ -71,26 +69,21 @@ void update_oled_display(const char *message1, const char *message2, const char 
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
     if (gpio == BOTAO_A)
     {
-        // Give to the counting semaphore for user entry
-        xSemaphoreGiveFromISR(xContadorSem, &xHigherPriorityTaskWoken);
-        Foi_A = true;
+        gpio_set_irq_enabled(BOTAO_A, GPIO_IRQ_EDGE_FALL, false);
+        xSemaphoreGiveFromISR(xContadorSemA, &xHigherPriorityTaskWoken);
     }
     else if (gpio == BOTAO_B)
     {
-        // Give to the counting semaphore for user exit (release)
-        xSemaphoreGiveFromISR(xContadorSem, &xHigherPriorityTaskWoken);
-        Foi_B = true;
+        gpio_set_irq_enabled(BOTAO_B, GPIO_IRQ_EDGE_FALL, false);
+        xSemaphoreGiveFromISR(xContadorSemB, &xHigherPriorityTaskWoken);
     }
     else if (gpio == BOTAO_JOYSTICK)
     {
-        // Give to the binary semaphore for system reset [cite: 5]
+        gpio_set_irq_enabled(BOTAO_JOYSTICK, GPIO_IRQ_EDGE_FALL, false);
         xSemaphoreGiveFromISR(xBinarySemaphoreReset, &xHigherPriorityTaskWoken);
-        Foi_Joystick = true;
     }
-
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
@@ -101,53 +94,50 @@ void vTaskEntrada(void *pvParameters)
     while (true)
     {
         // Espera o contador ser solto pelo botao A
-        if (xSemaphoreTake(xContadorSem, portMAX_DELAY) == pdTRUE)
+        if (xSemaphoreTake(xContadorSemA, portMAX_DELAY) == pdTRUE)
         {
-            if (Foi_A)
-            { // Verifica se o botao A foi precionado
-                Foi_A = false;
-                if (usuarios < MAX_USERS)
-                {
-                    usuarios++;
-                    char buffer[32];
-                    sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
-                    update_oled_display("Usuarios:", "Usuario entrou!", buffer);
-                }
-                else
-                {
-                    char buffer[32];
-                    sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
-                    update_oled_display("Usuarios:", "Sem capacidade", buffer);
-                    pwm_set_gpio_level(buzzer, 2048);
-                    vTaskDelay(pdMS_TO_TICKS(200));
-                    pwm_set_gpio_level(buzzer, 0);
-                }
-                if (usuarios == 0)
-                {
-                    gpio_put(led_BLUE, true);
-                    gpio_put(led_RED, false);
-                    gpio_put(led_GREEN, false);
-                }
-                else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
-                {
-                    gpio_put(led_BLUE, false);
-                    gpio_put(led_RED, false);
-                    gpio_put(led_GREEN, true);
-                }
-                else if (usuarios == (MAX_USERS - 1))
-                {
-                    gpio_put(led_BLUE, false);
-                    gpio_put(led_RED, true);
-                    gpio_put(led_GREEN, true);
-                }
-                else if (usuarios == MAX_USERS)
-                {
-                    gpio_put(led_BLUE, true);
-                    gpio_put(led_RED, true);
-                    gpio_put(led_GREEN, false);
-                }
-                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+            if (usuarios < MAX_USERS)
+            {
+                usuarios++;
+                char buffer[32];
+                sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                update_oled_display("Usuarios:", "Usuario entrou!", buffer);
             }
+            else
+            {
+                char buffer[32];
+                sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                update_oled_display("Usuarios:", "Sem capacidade", buffer);
+                pwm_set_gpio_level(buzzer, 2048);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                pwm_set_gpio_level(buzzer, 0);
+            }
+            if (usuarios == 0)
+            {
+                gpio_put(led_BLUE, true);
+                gpio_put(led_RED, false);
+                gpio_put(led_GREEN, false);
+            }
+            else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, false);
+                gpio_put(led_GREEN, true);
+            }
+            else if (usuarios == (MAX_USERS - 1))
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, true);
+                gpio_put(led_GREEN, true);
+            }
+            else if (usuarios == MAX_USERS)
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, true);
+                gpio_put(led_GREEN, false);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            gpio_set_irq_enabled(BOTAO_A, GPIO_IRQ_EDGE_FALL, true);
         }
     }
 }
@@ -159,50 +149,47 @@ void vTaskSaida(void *pvParameters)
     while (true)
     {
         // Espera o contador ser solto pelo botao B
-        if (xSemaphoreTake(xContadorSem, portMAX_DELAY) == pdTRUE)
-        {
-            if (Foi_B)
-            { // Verifica se foi precionado o B
-                Foi_B = false;
-                if (usuarios > 0)
-                {
-                    usuarios--;
-                    char buffer[32];
-                    sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
-                    update_oled_display("Usuarios:", "Usuario saiu!", buffer);
-                }
-                else
-                {
-                    char buffer[32];
-                    sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
-                    update_oled_display("Usuarios:", "Sem usuarios!", buffer);
-                }
-                if (usuarios == 0)
-                {
-                    gpio_put(led_BLUE, true);
-                    gpio_put(led_RED, false);
-                    gpio_put(led_GREEN, false);
-                }
-                else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
-                {
-                    gpio_put(led_BLUE, false);
-                    gpio_put(led_RED, false);
-                    gpio_put(led_GREEN, true);
-                }
-                else if (usuarios == (MAX_USERS - 1))
-                {
-                    gpio_put(led_BLUE, false);
-                    gpio_put(led_RED, true);
-                    gpio_put(led_GREEN, true);
-                }
-                else if (usuarios == MAX_USERS)
-                {
-                    gpio_put(led_BLUE, true);
-                    gpio_put(led_RED, true);
-                    gpio_put(led_GREEN, false);
-                }
-                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+        if (xSemaphoreTake(xContadorSemB, portMAX_DELAY) == pdTRUE)
+        { // Verifica se foi precionado o B
+            if (usuarios > 0)
+            {
+                usuarios--;
+                char buffer[32];
+                sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                update_oled_display("Usuarios:", "Usuario saiu!", buffer);
             }
+            else
+            {
+                char buffer[32];
+                sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                update_oled_display("Usuarios:", "Sem usuarios!", buffer);
+            }
+            if (usuarios == 0)
+            {
+                gpio_put(led_BLUE, true);
+                gpio_put(led_RED, false);
+                gpio_put(led_GREEN, false);
+            }
+            else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, false);
+                gpio_put(led_GREEN, true);
+            }
+            else if (usuarios == (MAX_USERS - 1))
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, true);
+                gpio_put(led_GREEN, true);
+            }
+            else if (usuarios == MAX_USERS)
+            {
+                gpio_put(led_BLUE, false);
+                gpio_put(led_RED, true);
+                gpio_put(led_GREEN, false);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            gpio_set_irq_enabled(BOTAO_B, GPIO_IRQ_EDGE_FALL, true);
         }
     }
 }
@@ -216,26 +203,22 @@ void vTaskReset(void *pvParameters)
         // Espera pelo semaforo binario
         if (xSemaphoreTake(xBinarySemaphoreReset, portMAX_DELAY) == pdTRUE)
         {
-            if (Foi_Joystick)
-            { // Verifica se o joystick foi precionado
-                Foi_Joystick = false;
-                usuarios = 0;
-                char buffer[32];
-                ssd1306_fill(&ssd, 0);
-                sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
-                update_oled_display("Usuarios:", "Sistema reiniciou!", buffer);
-                gpio_put(led_BLUE, true);
-                gpio_put(led_RED, false);
-                gpio_put(led_GREEN, false);
-                pwm_set_gpio_level(buzzer, 2048);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                pwm_set_gpio_level(buzzer, 0);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                pwm_set_gpio_level(buzzer, 2048);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                pwm_set_gpio_level(buzzer, 0);
-                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
-            }
+            usuarios = 0;
+            char buffer[32];
+            sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
+            update_oled_display("Usuarios:", "Sistema reiniciou!", buffer);
+            gpio_put(led_BLUE, true);
+            gpio_put(led_RED, false);
+            gpio_put(led_GREEN, false);
+            pwm_set_gpio_level(buzzer, 2048);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            pwm_set_gpio_level(buzzer, 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            pwm_set_gpio_level(buzzer, 2048);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            pwm_set_gpio_level(buzzer, 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            gpio_set_irq_enabled(BOTAO_JOYSTICK, GPIO_IRQ_EDGE_FALL, true);
         }
     }
 }
@@ -279,10 +262,16 @@ int main()
     gpio_set_dir(BOTAO_B, GPIO_IN);
     gpio_pull_up(BOTAO_B);
 
+    gpio_init(BOTAO_JOYSTICK);
+    gpio_set_dir(BOTAO_JOYSTICK, GPIO_IN);
+    gpio_pull_up(BOTAO_JOYSTICK);
+
     gpio_set_irq_enabled_with_callback(BOTAO_A, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
     gpio_set_irq_enabled(BOTAO_B, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BOTAO_JOYSTICK, GPIO_IRQ_EDGE_FALL, true);
 
-    xContadorSem = xSemaphoreCreateCounting(MAX_USERS, 0); // Cria semáforo de contagem (máximo 8, inicial 0)
+    xContadorSemA = xSemaphoreCreateCounting(1, 0); // Cria semáforo de contagem (máximo 8, inicial 0)
+    xContadorSemB = xSemaphoreCreateCounting(1, 0); // Cria semáforo de contagem (máximo 8, inicial 0)
     xBinarySemaphoreReset = xSemaphoreCreateBinary();      // Semaforo binario para reset
     xOLEDMutex = xSemaphoreCreateMutex();                  // Mutex para protecao do OLED
 

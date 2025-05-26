@@ -10,83 +10,233 @@
  */
 
 #include "pico/stdlib.h"
-#include "hardware/i2c.h"
 #include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/i2c.h"
 #include "lib/ssd1306.h"
+#include "lib/font.h"
 #include "FreeRTOS.h"
+#include "FreeRTOSConfig.h"
 #include "task.h"
+#include "queue.h"
+#include <stdio.h>
+#include "hardware/pio.h"
+#include "ws2812.pio.h"
+#include "hardware/pwm.h"
 #include "semphr.h"
 #include "pico/bootrom.h"
-#include "stdio.h"
 
 #define I2C_PORT i2c1
 #define I2C_SDA 14
 #define I2C_SCL 15
 #define ENDERECO 0x3C
 
-#define BOTAO_A 5 // Gera evento
-#define BOTAO_B 6 // BOOTSEL
+#define BOTAO_A 5         // Aumenta o número
+#define BOTAO_B 6         // Reduz o número
+#define BOTAO_JOYSTICK 22 // Zera contagem
+#define buzzer 10         // Pino do buzzer A
+#define led_RED 13        // Red=13, Blue=12, Green=11
+#define led_BLUE 12       // Red=13, Blue=12, Green=11
+#define led_GREEN 11      // Red=13, Blue=12, Green=11
 
+#define MAX_USERS 8
+
+bool Foi_A = false;
+bool Foi_B = false;
+bool Foi_Joystick = false;
 ssd1306_t ssd;
 SemaphoreHandle_t xContadorSem;
+SemaphoreHandle_t xBinarySemaphoreReset;
+SemaphoreHandle_t xOLEDMutex;
 uint16_t eventosProcessados = 0;
+uint8_t usuarios = 0;
 
-// ISR do botão A (incrementa o semáforo de contagem)
-void gpio_callback(uint gpio, uint32_t events)
+void update_oled_display(const char *message1, const char *message2, const char *count_message)
+{
+    if (xSemaphoreTake(xOLEDMutex, portMAX_DELAY) == pdTRUE)
+    {
+        ssd1306_fill(&ssd, 0);
+        if (message1)
+            ssd1306_draw_string(&ssd, (char *)message1, 5, 10);
+        if (message2)
+            ssd1306_draw_string(&ssd, (char *)message2, 5, 45);
+        if (count_message)
+            ssd1306_draw_string(&ssd, (char *)count_message, 5, 25);
+        ssd1306_send_data(&ssd);
+        xSemaphoreGive(xOLEDMutex);
+    }
+}
+
+// interrupcoes para os botoes
+void gpio_irq_handler(uint gpio, uint32_t events)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(xContadorSem, &xHigherPriorityTaskWoken);
+
+    if (gpio == BOTAO_A)
+    {
+        // Give to the counting semaphore for user entry
+        xSemaphoreGiveFromISR(xContadorSem, &xHigherPriorityTaskWoken);
+        Foi_A = true;
+    }
+    else if (gpio == BOTAO_B)
+    {
+        // Give to the counting semaphore for user exit (release)
+        xSemaphoreGiveFromISR(xContadorSem, &xHigherPriorityTaskWoken);
+        Foi_B = true;
+    }
+    else if (gpio == BOTAO_JOYSTICK)
+    {
+        // Give to the binary semaphore for system reset [cite: 5]
+        xSemaphoreGiveFromISR(xBinarySemaphoreReset, &xHigherPriorityTaskWoken);
+        Foi_Joystick = true;
+    }
+
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-// Tarefa que consome eventos e mostra no display
-void vContadorTask(void *params)
+// Tarefa para entrada
+void vTaskEntrada(void *pvParameters)
 {
-    char buffer[32];
-
-    // Tela inicial
-    ssd1306_fill(&ssd, 0);
-    ssd1306_draw_string(&ssd, "Aguardando ", 5, 25);
-    ssd1306_draw_string(&ssd, "  evento...", 5, 34);
-    ssd1306_send_data(&ssd);
-
+    (void)pvParameters;
     while (true)
     {
-        // Aguarda semáforo (um evento)
+        // Espera o contador ser solto pelo botao A
         if (xSemaphoreTake(xContadorSem, portMAX_DELAY) == pdTRUE)
         {
-            eventosProcessados++;
-
-            // Atualiza display com a nova contagem
-            ssd1306_fill(&ssd, 0);
-            sprintf(buffer, "Eventos: %d", eventosProcessados);
-            ssd1306_draw_string(&ssd, "Evento ", 5, 10);
-            ssd1306_draw_string(&ssd, "recebido!", 5, 19);
-            ssd1306_draw_string(&ssd, buffer, 5, 44);
-            ssd1306_send_data(&ssd);
-
-            // Simula tempo de processamento
-            vTaskDelay(pdMS_TO_TICKS(1500));
-
-            // Retorna à tela de espera
-            ssd1306_fill(&ssd, 0);
-            ssd1306_draw_string(&ssd, "Aguardando ", 5, 25);
-            ssd1306_draw_string(&ssd, "  evento...", 5, 34);
-            ssd1306_send_data(&ssd);
+            if (Foi_A)
+            { // Verifica se o botao A foi precionado
+                Foi_A = false;
+                if (usuarios < MAX_USERS)
+                {
+                    usuarios++;
+                    char buffer[32];
+                    sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                    update_oled_display("Usuarios:", "Usuario entrou!", buffer);
+                }
+                else
+                {
+                    char buffer[32];
+                    sprintf(buffer, "%d/%d", usuarios, MAX_USERS);
+                    update_oled_display("Usuarios:", "Sem capacidade", buffer);
+                    pwm_set_gpio_level(buzzer, 2048);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    pwm_set_gpio_level(buzzer, 0);
+                }
+                if (usuarios == 0)
+                {
+                    gpio_put(led_BLUE, true);
+                    gpio_put(led_RED, false);
+                    gpio_put(led_GREEN, false);
+                }
+                else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
+                {
+                    gpio_put(led_BLUE, false);
+                    gpio_put(led_RED, false);
+                    gpio_put(led_GREEN, true);
+                }
+                else if (usuarios == (MAX_USERS - 1))
+                {
+                    gpio_put(led_BLUE, false);
+                    gpio_put(led_RED, true);
+                    gpio_put(led_GREEN, true);
+                }
+                else if (usuarios == MAX_USERS)
+                {
+                    gpio_put(led_BLUE, true);
+                    gpio_put(led_RED, true);
+                    gpio_put(led_GREEN, false);
+                }
+                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+            }
         }
     }
 }
 
-// ISR para BOOTSEL e botão de evento
-void gpio_irq_handler(uint gpio, uint32_t events)
+// Task for user exit (Button B) [cite: 8]
+void vTaskSaida(void *pvParameters)
 {
-    if (gpio == BOTAO_B)
+    (void)pvParameters;
+    while (true)
     {
-        reset_usb_boot(0, 0);
+        // Espera o contador ser solto pelo botao B
+        if (xSemaphoreTake(xContadorSem, portMAX_DELAY) == pdTRUE)
+        {
+            if (Foi_B)
+            { // Verifica se foi precionado o B
+                Foi_B = false;
+                if (usuarios > 0)
+                {
+                    usuarios--;
+                    char buffer[32];
+                    sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
+                    update_oled_display("Usuarios:", "Usuario saiu!", buffer);
+                }
+                else
+                {
+                    char buffer[32];
+                    sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
+                    update_oled_display("Usuarios:", "Sem usuarios!", buffer);
+                }
+                if (usuarios == 0)
+                {
+                    gpio_put(led_BLUE, true);
+                    gpio_put(led_RED, false);
+                    gpio_put(led_GREEN, false);
+                }
+                else if (usuarios >= 0 && usuarios <= (MAX_USERS - 2))
+                {
+                    gpio_put(led_BLUE, false);
+                    gpio_put(led_RED, false);
+                    gpio_put(led_GREEN, true);
+                }
+                else if (usuarios == (MAX_USERS - 1))
+                {
+                    gpio_put(led_BLUE, false);
+                    gpio_put(led_RED, true);
+                    gpio_put(led_GREEN, true);
+                }
+                else if (usuarios == MAX_USERS)
+                {
+                    gpio_put(led_BLUE, true);
+                    gpio_put(led_RED, true);
+                    gpio_put(led_GREEN, false);
+                }
+                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+            }
+        }
     }
-    else if (gpio == BOTAO_A)
+}
+
+// Funcao para reiniciar sistema
+void vTaskReset(void *pvParameters)
+{
+    (void)pvParameters;
+    while (true)
     {
-        gpio_callback(gpio, events);
+        // Espera pelo semaforo binario
+        if (xSemaphoreTake(xBinarySemaphoreReset, portMAX_DELAY) == pdTRUE)
+        {
+            if (Foi_Joystick)
+            { // Verifica se o joystick foi precionado
+                Foi_Joystick = false;
+                usuarios = 0;
+                char buffer[32];
+                ssd1306_fill(&ssd, 0);
+                sprintf(buffer, "Usuarios: %d/%d", usuarios, MAX_USERS);
+                update_oled_display("Usuarios:", "Sistema reiniciou!", buffer);
+                gpio_put(led_BLUE, true);
+                gpio_put(led_RED, false);
+                gpio_put(led_GREEN, false);
+                pwm_set_gpio_level(buzzer, 2048);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                pwm_set_gpio_level(buzzer, 0);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                pwm_set_gpio_level(buzzer, 2048);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                pwm_set_gpio_level(buzzer, 0);
+                vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+            }
+        }
     }
 }
 
@@ -104,6 +254,22 @@ int main()
     ssd1306_config(&ssd);
     ssd1306_send_data(&ssd);
 
+    gpio_init(led_RED);
+    gpio_set_dir(led_RED, GPIO_OUT);
+    gpio_init(led_BLUE);
+    gpio_set_dir(led_BLUE, GPIO_OUT);
+    gpio_init(led_GREEN);
+    gpio_set_dir(led_GREEN, GPIO_OUT);
+    gpio_put(led_BLUE, true); // inicia com Azul
+
+    // iniciacao buzzer
+    gpio_set_function(buzzer, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(buzzer);
+    pwm_set_wrap(slice_num, 4096);
+    // Define o clock divider como 440 (nota lá para o buzzer)
+    pwm_set_clkdiv(slice_num, 440.0f);
+    pwm_set_enabled(slice_num, true);
+
     // Configura os botões
     gpio_init(BOTAO_A);
     gpio_set_dir(BOTAO_A, GPIO_IN);
@@ -116,11 +282,14 @@ int main()
     gpio_set_irq_enabled_with_callback(BOTAO_A, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
     gpio_set_irq_enabled(BOTAO_B, GPIO_IRQ_EDGE_FALL, true);
 
-    // Cria semáforo de contagem (máximo 10, inicial 0)
-    xContadorSem = xSemaphoreCreateCounting(10, 0);
+    xContadorSem = xSemaphoreCreateCounting(MAX_USERS, 0); // Cria semáforo de contagem (máximo 8, inicial 0)
+    xBinarySemaphoreReset = xSemaphoreCreateBinary();      // Semaforo binario para reset
+    xOLEDMutex = xSemaphoreCreateMutex();                  // Mutex para protecao do OLED
 
     // Cria tarefa
-    xTaskCreate(vContadorTask, "ContadorTask", configMINIMAL_STACK_SIZE + 128, NULL, 1, NULL);
+    xTaskCreate(vTaskEntrada, "EntradaTask", configMINIMAL_STACK_SIZE + 128, NULL, 1, NULL);
+    xTaskCreate(vTaskSaida, "SaidaTask", configMINIMAL_STACK_SIZE + 128, NULL, 1, NULL);
+    xTaskCreate(vTaskReset, "ResetTask", configMINIMAL_STACK_SIZE + 128, NULL, 3, NULL);
 
     vTaskStartScheduler();
     panic_unsupported();
